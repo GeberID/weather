@@ -8,10 +8,11 @@
 #include <WiFiUdp.h>
 #include <JSON_Decoder.h>
 #include <OpenWeather.h>
+#include <ArduinoOTA.h>  // OTA обновление
 
 // Настройки периодичности обновления данных
-#define PERIOD_SENSOR   60000   // обновление показаний с датчика (60 секунд)
-#define PERIOD_FORECAST 600000  // период обновления прогноза (600 секунд = 10 минут)
+#define PERIOD_SENSOR 60000       // обновление показаний с датчика (60 секунд)
+#define PERIOD_FORECAST 600000      // период обновления прогноза (600 секунд = 10 минут)
 
 // WiFi настройки
 const char *ssid = "";
@@ -19,16 +20,19 @@ const char *password = "";
 
 // OpenWeather API настройки
 String api_key   = "";
-String latitude  = "";   // широта
-String longitude = "";   // долгота
+String latitude  = "59.57";   // широта
+String longitude = "30.19";   // долгота
 String units     = "metric";  // "metric" для °C, "imperial" для °F
 String language  = "en";      // язык ответов
 
-// Глобальная переменная для переключения экрана:
-// 0 – домашние датчики, 1 – прогноз (основной), 2 – прогноз (расширенный)
+// Глобальная переменная для переключения экранов:
+// 0 – домашние датчики,
+// 1 – прогноз погоды (основной, температура, давление и влажность),
+// 2 – расширенный прогноз (ветер, облачность),
+// 3 – прогноз на ближайшие 3 часа (температура, влажность и вероятность осадков)
 volatile int screen = 0;
 
-// Таймер для датчиков
+// Таймер для обновления сенсорных данных
 uint32_t sensorTimer = 0;
 
 // Объекты библиотек
@@ -36,45 +40,36 @@ DFRobot_SHT20 sht20;
 GyverOLED<SSH1106_128x64> oled;
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "europe.pool.ntp.org", 10800, 60000);
-OW_Weather ow;  // объект для работы с OpenWeather
+OW_Weather ow;  // работа с OpenWeather
 
-// Глобальные переменные для хранения данных домашнего датчика
+// Глобальные переменные для хранения данных локального датчика
 String tempHome;
 String humidityHome;
 
-// Глобальная переменная для хранения данных прогноза погоды.
-// Для упрощения динамического выделения памяти будем использовать указатель,
-// который обновляется в отдельной задаче.
+// Глобальная переменная для хранения прогноза погоды.
 volatile OW_forecast *globalForecast = nullptr;
 
-// Для защиты доступа можно использовать мьютекс (но в простом примере это не критично).
-
-// Обработчик одиночного нажатия кнопки для переключения экранов.
-// Используем операцию по модулю для цикличного переключения.
+// Обработчик одиночного нажатия кнопки для переключения экранов
 static void onButtonSingleClickCb(void *button_handle, void *usr_data) {
-  screen = (screen + 1) % 3;
+  screen = (screen + 1) % 4;
 }
 
-// Задача для получения прогноза погоды (работает в отдельном потоке)
-void fetchForecastTask(void * parameter) {
-  // Задержка перед первым запросом, чтобы WiFi и NTP успели установиться
-  delay(5000);
-  
+// Задача для получения прогноза погоды (блокирующие вызовы происходят в отдельном потоке)
+void fetchForecastTask(void *parameter) {
+  delay(5000); // Ждем, чтобы система и WiFi успели установиться
+
   for (;;) {
     OW_forecast *newForecast = new OW_forecast;
-    // Получить прогноз. Функция getForecast является блокирующей,
-    // но поскольку она вызывается в отдельной задаче, основной цикл не "замерзнет".
+    // Получение прогноза (блокирующий вызов)
     ow.getForecast(newForecast, api_key, latitude, longitude, units, language);
-    
-    // Обновляем глобальный указатель.
-    // Освобождаем старую память, если данные уже были получены.
+
+    // Обновление глобального указателя с прогнозом.
     if (globalForecast != nullptr) {
       delete globalForecast;
     }
     globalForecast = newForecast;
-    
-    // Ждем заданное время до следующего обновления.
-    // Здесь можно регулировать частоту обновления прогноза.
+
+    // Ждем до следующего обновления прогноза
     vTaskDelay(PERIOD_FORECAST / portTICK_PERIOD_MS);
   }
 }
@@ -85,7 +80,7 @@ void setup() {
 
   // Инициализация датчика температуры и влажности
   sht20.initSHT20();
-  delay(100);  // время на инициализацию
+  delay(100);
   sht20.checkSHT20();
 
   // Инициализация дисплея
@@ -111,7 +106,7 @@ void setup() {
     Serial.println("Connecting...");
     delay(100);
   }
-  
+
   oled.clear();
   oled.home();
   oled.print("Connected to WiFi");
@@ -122,28 +117,66 @@ void setup() {
   // Инициализация NTP клиента для получения времени
   timeClient.begin();
 
-  // Инициализация кнопки. Обратите внимание, что используем динамическое выделение памяти.
+  // Инициализация OTA
+  ArduinoOTA.setHostname("Weather_Station");
+  ArduinoOTA.setPassword("");
+
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA update started");
+    oled.clear();
+    oled.home();
+    oled.print("OTA update...");
+    oled.update();
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("OTA update finished");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("OTA Progress: %u%%\r\n", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR)
+      Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR)
+      Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR)
+      Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR)
+      Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR)
+      Serial.println("End Failed");
+  });
+  ArduinoOTA.begin();
+  Serial.println("OTA Ready");
+
+  delay(1000); // Небольшая задержка для стабильного запуска OTA
+
+  // Инициализация кнопки для переключения экранов
   Button *btnRight = new Button(GPIO_NUM_33, false);
   btnRight->attachSingleClickEventCb(&onButtonSingleClickCb, NULL);
 
-  // Первоначальное считывание данных с локальных датчиков
+  // Первичное считывание данных с локальных датчиков
   tempHome = sht20.readTemperature();
   humidityHome = sht20.readHumidity();
 
-  // Создаем задачу для получения прогноза погоды.
+  // Создание задачи для получения прогноза погоды
   xTaskCreatePinnedToCore(
     fetchForecastTask,   // функция задачи
     "ForecastTask",      // название задачи
-    8192,                // объем памяти (стека) для задачи
-    NULL,                // параметр задачи
+    8192,                // размер стека
+    NULL,                // параметры задачи
     1,                   // приоритет
     NULL,                // дескриптор задачи
-    1                    // закрепляем за ядром 1 (текущее ядро можно изменить)
+    1                    // привязка к ядру (при необходимости можно изменить)
   );
 }
 
 void loop() {
-  // Обновляем NTP время
+  // Обработка OTA обновлений
+  ArduinoOTA.handle();
+
+  // Обновляем время по NTP
   timeClient.update();
 
   // Обновление локальных датчиков каждые PERIOD_SENSOR мс
@@ -153,12 +186,12 @@ void loop() {
     humidityHome = sht20.readHumidity();
   }
 
-  // Отображение экранов в зависимости от значения переменной screen
+  // Подготовка дисплея к обновлению экрана
   oled.clear();
   oled.home();
 
   switch (screen) {
-    case 0: { // Экран с локальными показаниями
+    case 0: {  // Экран локальных датчиков
       oled.print("Kitchen");
       oled.setCursor(0, 2);
       oled.print("Temp: ");
@@ -166,13 +199,11 @@ void loop() {
       oled.setCursor(0, 4);
       oled.print("Humid: ");
       oled.print(humidityHome);
-      
       oled.setCursor(0, 6);
       oled.print(timeClient.getFormattedTime());
       break;
     }
-    case 1: { // Экран прогноза (основной)
-      // При отсутствии полученных данных, выводим сообщение
+    case 1: {  // Экран прогноза (основной)
       if (globalForecast == nullptr) {
         oled.print("Forecast loading...");
       } else {
@@ -182,15 +213,14 @@ void loop() {
         oled.print(globalForecast->temp[0]);
         oled.setCursor(0, 4);
         oled.print("Press: ");
-        // Перевод давления из гПа в мм рт.ст. (приблизительно)
-        oled.print(globalForecast->pressure[0] * 0.75);
+        oled.print(globalForecast->pressure[0] * 0.75);  // давление в мм рт.ст.
         oled.setCursor(0, 6);
         oled.print("Humid: ");
         oled.print(globalForecast->humidity[0]);
       }
       break;
     }
-    case 2: { // Экран прогноза (расширенный)
+    case 2: {  // Расширенный прогноз
       if (globalForecast == nullptr) {
         oled.print("Forecast loading...");
       } else {
@@ -201,23 +231,41 @@ void loop() {
         oled.setCursor(0, 4);
         oled.print("Clouds: ");
         oled.print(globalForecast->clouds_all[0]);
-        oled.setCursor(0, 6);
-        oled.print("Visibility: ");
-        oled.print(globalForecast->visibility[0]);
       }
       break;
     }
-    default:
+    case 3: {  // Прогноз на ближайшие 3 часа
+      if (globalForecast == nullptr) {
+        oled.print("Forecast loading...");
+      } else {
+        oled.print("Next 3h Forecast");
+        oled.setCursor(0, 2);
+        oled.print("Temp: ");
+        oled.print(globalForecast->temp[0]);
+        oled.setCursor(0, 4);
+        oled.print("Humid: ");
+        oled.print(globalForecast->humidity[0]);
+        oled.setCursor(0, 6);
+        oled.print("Rain: ");
+        float pop = (globalForecast->pop[0] != 0 ? globalForecast->pop[0] 
+                      : (float)globalForecast->clouds_all[0] / 100.0);
+        oled.print(pop * 100, 0);
+        oled.print("%");
+      }
+      break;
+    }
+    default: {
       oled.print("Screen err");
+      break;
+    }
   }
 
   oled.update();
 
-  // Для отладки вывод в Serial
+  // Отладочный вывод в Serial
   Serial.print("Local Temp: ");
   Serial.print(tempHome);
   Serial.println(" C");
 
-  // Короткая задержка для предотвращения перегрузки цикла
   delay(10);
 }
