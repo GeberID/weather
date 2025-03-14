@@ -35,6 +35,13 @@ volatile int screen = 0;
 // Таймер для обновления сенсорных данных
 uint32_t sensorTimer = 0;
 
+// Сохраним время старта устройства (в миллисекундах)
+uint32_t millisAtStart = 0;
+
+// Параметры коррекции нагрева датчика
+const float MAX_OFFSET = 5.53;    // максимальное смещение (°C), достигнуто через 30 минут
+const unsigned long CORRECION_TIME = 1800UL * 1000;  // 30 минут в миллисекундах
+
 // Объекты библиотек
 DFRobot_SHT20 sht20;
 GyverOLED<SSH1106_128x64> oled;
@@ -48,6 +55,21 @@ String humidityHome;
 
 // Глобальная переменная для хранения прогноза погоды.
 volatile OW_forecast *globalForecast = nullptr;
+
+// Функция расчета коррекции нагрева для датчика
+float temperatureCorrection() {
+  // Определяем время работы устройства в мс
+  unsigned long elapsed = millis() - millisAtStart;
+  
+  // Если прошло меньше CORRECION_TIME, линейный рост смещения, иначе максимальное смещение
+  float offset;
+  if (elapsed < CORRECION_TIME) {
+    offset = (float)elapsed / CORRECION_TIME * MAX_OFFSET;
+  } else {
+    offset = MAX_OFFSET;
+  }
+  return offset;
+}
 
 // Обработчик одиночного нажатия кнопки для переключения экранов
 static void onButtonSingleClickCb(void *button_handle, void *usr_data) {
@@ -77,6 +99,9 @@ void fetchForecastTask(void *parameter) {
 void setup() {
   Serial.begin(115200);
   Wire.begin();
+
+  // Сохраняем время старта для вычисления коррекции нагрева
+  millisAtStart = millis();
 
   // Инициализация датчика температуры и влажности
   sht20.initSHT20();
@@ -156,8 +181,15 @@ void setup() {
   Button *btnRight = new Button(GPIO_NUM_33, false);
   btnRight->attachSingleClickEventCb(&onButtonSingleClickCb, NULL);
 
-  // Первичное считывание данных с локальных датчиков
-  tempHome = sht20.readTemperature();
+  // Первичное считывание данных с локальных датчиков с учетом начальной коррекции
+  {
+    String rawTemp = sht20.readTemperature();
+    float tempVal = rawTemp.toFloat();
+    float offset = temperatureCorrection();
+    float correctedTemp = tempVal - offset;
+    // Преобразуем обратно в строку для удобного вывода
+    tempHome = String(correctedTemp, 2);
+  }
   humidityHome = sht20.readHumidity();
 
   // Создание задачи для получения прогноза погоды
@@ -173,7 +205,6 @@ void setup() {
 }
 
 void loop() {
-  // Обработка OTA обновлений
   ArduinoOTA.handle();
 
   // Обновляем время по NTP
@@ -182,8 +213,23 @@ void loop() {
   // Обновление локальных датчиков каждые PERIOD_SENSOR мс
   if (millis() - sensorTimer >= PERIOD_SENSOR) {
     sensorTimer = millis();
-    tempHome = sht20.readTemperature();
+    // Чтение температуры и применение коррекции нагрева.
+    String rawTemp = sht20.readTemperature();
+    float tempVal = rawTemp.toFloat();
+    float offset = temperatureCorrection();
+    float correctedTemp = tempVal - offset;
+    tempHome = String(correctedTemp, 2);
+
     humidityHome = sht20.readHumidity();
+
+    // Вывод отладочной информации в Serial
+    Serial.print("Raw Temp: ");
+    Serial.print(tempVal);
+    Serial.print(" C, Offset: ");
+    Serial.print(offset);
+    Serial.print(" C, Corrected Temp: ");
+    Serial.print(correctedTemp);
+    Serial.println(" C");
   }
 
   // Подготовка дисплея к обновлению экрана
@@ -261,11 +307,6 @@ void loop() {
   }
 
   oled.update();
-
-  // Отладочный вывод в Serial
-  Serial.print("Local Temp: ");
-  Serial.print(tempHome);
-  Serial.println(" C");
 
   delay(10);
 }
