@@ -10,23 +10,35 @@
 #include <OpenWeather.h>
 #include <ArduinoOTA.h>
 
-#define PERIOD_SENSOR 60000       
-#define PERIOD_FORECAST 600000    
+#define DEFAULT_SENSOR_PERIOD 60000
+#define HOLD_SENSOR_PERIOD 250
+#define PERIOD_FORECAST 600000
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+uint8_t temprature_sens_read();
+#ifdef __cplusplus
+}
+#endif
+uint8_t temprature_sens_read();
 
 const char *ssid = "";
 const char *password = "";
+
 String api_key = "";
-String latitude = "59.57";     
-String longitude = "30.19";    
-String units = "metric";       
-String language = "en";        
+String latitude = "";
+String longitude = "";
+String units = "metric";
+String language = "en";
 
 volatile int screen = 0;
 uint32_t sensorTimer = 0;
 uint32_t millisAtStart = 0;
+uint32_t sensorPeriod = DEFAULT_SENSOR_PERIOD;
 
-const float MAX_OFFSET = 5.53;         // Максимальное смещение (°C)
-const unsigned long CORRECTION_TIME = 1800000UL; // 30 минут в мс
+const float MAX_OFFSET = 5.05;
+const unsigned long CORRECTION_TIME = 600000UL;
 
 DFRobot_SHT20 sht20;
 GyverOLED<SSH1106_128x64> oled;
@@ -35,15 +47,44 @@ NTPClient timeClient(ntpUDP, "europe.pool.ntp.org", 10800, 60000);
 OW_Weather ow;
 
 String tempHome, humidityHome;
-volatile OW_forecast *globalForecast = nullptr;
+OW_forecast *globalForecast = nullptr;
+
+int lastUpdatedDay = -1;
+
+unsigned long lastButtonPressTime = 0;
+bool isDimmed = false;
+const unsigned long BRIGHTNESS_TIMEOUT = 60000;
+float esp32Temp;
 
 float temperatureCorrection() {
   unsigned long elapsed = millis() - millisAtStart;
-  return (elapsed < CORRECTION_TIME) ? float(elapsed) / CORRECTION_TIME * MAX_OFFSET : MAX_OFFSET;
+  return (elapsed < CORRECTION_TIME) ? (float)elapsed / CORRECTION_TIME * MAX_OFFSET : MAX_OFFSET;
 }
 
-static void onButtonSingleClickCb(void *b, void *u) {
+static void onButtonSingleClickCbRight(void *b, void *u) {
   screen = (screen + 1) % 4;
+  resetBrightness();
+}
+static void onButtonSingleClickCbLeft(void *b, void *u) {
+  screen = (screen - 1 + 4) % 4;
+  resetBrightness();
+}
+
+static void onButtonHoldCb(void *b, void *u) {
+  sensorPeriod = HOLD_SENSOR_PERIOD;
+}
+
+static void onButtonReleaseCb(void *b, void *u) {
+  sensorPeriod = DEFAULT_SENSOR_PERIOD;
+}
+
+// Функция для сброса таймера и установки максимальной яркости
+void resetBrightness() {
+  lastButtonPressTime = millis();
+  if (isDimmed) {
+    oled.setContrast(255);  // максимальная яркость
+    isDimmed = false;
+  }
 }
 
 void fetchForecastTask(void *parameter) {
@@ -61,108 +102,190 @@ void setup() {
   Serial.begin(115200);
   Wire.begin();
   millisAtStart = millis();
-  sht20.initSHT20(); delay(100); sht20.checkSHT20();
 
-  oled.init(); oled.setScale(2);
-  oled.clear(); oled.home();
-  oled.print("Weather station"); oled.setCursor(0,2); oled.print("Connecting");
-  oled.setCursor(0,4); oled.print(ssid); oled.update();
+  sht20.initSHT20();
+  delay(100);
+  sht20.checkSHT20();
+
+  oled.init();
+  oled.setScale(2);
+  oled.autoPrintln(true);
+  oled.setContrast(255);
+  oled.clear();
+  oled.home();
+  oled.print("Weather station");
+  oled.setCursor(0, 2);
+  oled.print("Connecting");
+  oled.setCursor(0, 4);
+  oled.print(ssid);
+  oled.update();
+
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
-    oled.clear(); oled.home();
-    oled.print("Connecting to WiFi..."); oled.update();
+    oled.clear();
+    oled.home();
+    oled.print("Connecting to WiFi...");
+    oled.update();
     Serial.println("Connecting...");
     delay(100);
   }
-  
-  oled.clear(); oled.home();
-  oled.print("Connected to WiFi"); oled.setCursor(0,2);
-  oled.print(WiFi.localIP()); oled.update();
+
+  oled.clear();
+  oled.home();
+  oled.print("Connected to WiFi");
+  oled.setCursor(0, 2);
+  oled.print(WiFi.localIP());
+  oled.update();
 
   timeClient.begin();
+  while (!timeClient.isTimeSet()) {
+    timeClient.forceUpdate();
+  }
+  lastUpdatedDay = timeClient.getDay();
+
   ArduinoOTA.setHostname("Weather_Station");
-  ArduinoOTA.setPassword("");
-  ArduinoOTA.onStart([](){ Serial.println("OTA update started"); oled.clear(); oled.home(); oled.print("OTA update..."); oled.update(); });
-  ArduinoOTA.onEnd([](){ Serial.println("OTA update finished"); });
-  ArduinoOTA.onProgress([](unsigned int p, unsigned int t){ Serial.printf("OTA Progress: %u%%\r\n", (p / (t / 100))); });
-  ArduinoOTA.onError([](ota_error_t error){
-    Serial.printf("OTA Error[%u]: ", error);
-    if(error==OTA_AUTH_ERROR) Serial.println("Auth Failed");
-    else if(error==OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-    else if(error==OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-    else if(error==OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-    else if(error==OTA_END_ERROR) Serial.println("End Failed");
+  ArduinoOTA.setPassword("He89!on67@");
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA update started");
+    oled.clear();
+    oled.home();
+    oled.print("OTA update...");
+    oled.update();
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("OTA update finished");
+  });
+  ArduinoOTA.onProgress([](unsigned int p, unsigned int t) {
+    Serial.printf("OTA Progress: %u%%\r\n", (p / (t / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t err) {
+    Serial.printf("OTA Error[%u]: ", err);
+    if (err == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (err == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (err == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (err == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (err == OTA_END_ERROR) Serial.println("End Failed");
   });
   ArduinoOTA.begin();
   Serial.println("OTA Ready");
   delay(1000);
 
   Button *btnRight = new Button(GPIO_NUM_33, false);
-  btnRight->attachSingleClickEventCb(&onButtonSingleClickCb, NULL);
-
-  // Первичное считывание с коррекцией
+  Button *btnLeft = new Button(GPIO_NUM_32, false);
+  btnRight->attachSingleClickEventCb(&onButtonSingleClickCbRight, NULL);
+  btnLeft->attachSingleClickEventCb(&onButtonSingleClickCbLeft, NULL);
+  btnRight->attachLongPressHoldEventCb(&onButtonHoldCb, NULL);
+  btnRight->attachLongPressUpEventCb(&onButtonReleaseCb, NULL);
   {
-    float tempVal = sht20.readTemperature().toFloat();
+    float tempVal = sht20.readTemperature();
     float offset = temperatureCorrection();
     tempHome = String(tempVal - offset, 2);
   }
   humidityHome = sht20.readHumidity();
 
   xTaskCreatePinnedToCore(fetchForecastTask, "ForecastTask", 8192, NULL, 1, NULL, 1);
+  oled.autoPrintln(false);
 }
 
 void loop() {
   ArduinoOTA.handle();
-  timeClient.update();
+  int currentDay = timeClient.getDay();
+  if (timeClient.getHours() == 0 && timeClient.getMinutes() == 0 && lastUpdatedDay != currentDay) {
+    Serial.println("Midnight, updating time from NTP...");
+    timeClient.update();
+    lastUpdatedDay = currentDay;
+  }
+  if ((millis() - lastButtonPressTime >= BRIGHTNESS_TIMEOUT) && !isDimmed) {
+    oled.setContrast(10);  // минимальная яркость
+    isDimmed = true;
+  }
 
-  if (millis() - sensorTimer >= PERIOD_SENSOR) {
+  if (millis() - sensorTimer >= sensorPeriod) {
     sensorTimer = millis();
-    float tempVal = sht20.readTemperature().toFloat();
+    float tempVal = sht20.readTemperature();
     float offset = temperatureCorrection();
     tempHome = String(tempVal - offset, 2);
     humidityHome = sht20.readHumidity();
-    Serial.print("Raw Temp: "); Serial.print(tempVal);
-    Serial.print(" C, Offset: "); Serial.print(offset);
-    Serial.print(" C, Corrected: "); Serial.print(tempHome); Serial.println(" C");
+
+    Serial.print("Raw Temp: ");
+    Serial.print(tempVal);
+    Serial.print(" C, Offset: ");
+    Serial.print(offset);
+    Serial.print(" C, Corrected: ");
+    Serial.print(tempHome);
+    Serial.println(" C");
   }
 
-  oled.clear(); oled.home();
+  oled.clear();
+  oled.home();
   switch (screen) {
-    case 0: // Домашние датчики
+    case 0:
       oled.print("Kitchen");
-      oled.setCursor(0,2); oled.print("Temp: "); oled.print(tempHome);
-      oled.setCursor(0,4); oled.print("Humid: "); oled.print(humidityHome);
-      oled.setCursor(0,6); oled.print(timeClient.getFormattedTime());
+      oled.setCursor(0, 2);
+      oled.print("Temp: ");
+      oled.print(tempHome);
+      oled.setCursor(0, 4);
+      oled.print("Humid:");
+      oled.print(humidityHome);
+      oled.setCursor(0, 6);
+      oled.print(timeClient.getFormattedTime());
       break;
-    case 1: // Прогноз основной
-      if (!globalForecast) { oled.print("Forecast loading..."); }
-      else {
-        oled.print("Saint Petersburg");
-        oled.setCursor(0,2); oled.print("Temp: "); oled.print(globalForecast->temp[0]);
-        oled.setCursor(0,4); oled.print("Press: "); oled.print(globalForecast->pressure[0] * 0.75);
-        oled.setCursor(0,6); oled.print("Humid: "); oled.print(globalForecast->humidity[0]);
+    case 1:
+      if (!globalForecast) {
+        oled.autoPrintln(true);
+        oled.print("Forecast loading...");
+        oled.autoPrintln(false);
+      } else {
+        oled.print("SBP");
+        oled.setCursor(0, 2);
+        oled.print("Temp: ");
+        oled.print(globalForecast->temp[0]);
+        oled.setCursor(0, 4);
+        oled.print("Press: ");
+        oled.print(globalForecast->pressure[0] * 0.75);
+        oled.setCursor(0, 6);
+        oled.print("Humid: ");
+        oled.print(globalForecast->humidity[0]);
       }
       break;
-    case 2: // Расширенный прогноз
-      if (!globalForecast) { oled.print("Forecast loading..."); }
-      else {
-        oled.print("Saint Petersburg");
-        oled.setCursor(0,2); oled.print("Wind: "); oled.print(globalForecast->wind_speed[0]);
-        oled.setCursor(0,4); oled.print("Clouds: "); oled.print(globalForecast->clouds_all[0]);
+    case 2:
+      if (!globalForecast) {
+        oled.autoPrintln(true);
+        oled.print("Forecast loading...");
+        oled.autoPrintln(false);
+      } else {
+        oled.print("Rain: ");
+        oled.print(globalForecast->pop[0]);
+        oled.print("%");
+        oled.setCursor(0, 2);
+        oled.print("Vis: ");
+        oled.print(globalForecast->visibility[0]);
+        oled.setCursor(0, 4);
+        oled.print("Clouds: ");
+        oled.print(globalForecast->clouds_all[0]);
       }
       break;
-    case 3: // Прогноз на 3 часа
-      if (!globalForecast) { oled.print("Forecast loading..."); }
-      else {
-        oled.print("Next 3h Forecast");
-        oled.setCursor(0,2); oled.print("Temp: "); oled.print(globalForecast->temp[0]);
-        oled.setCursor(0,4); oled.print("Humid: "); oled.print(globalForecast->humidity[0]);
-        oled.setCursor(0,6); 
-        oled.print("Rain: "); 
-        float pop = (globalForecast->pop[0] != 0) ? globalForecast->pop[0] : float(globalForecast->clouds_all[0]) / 100.0;
-        oled.print(pop * 100, 0); oled.print("%");
+    case 3:
+      if (!globalForecast) {
+        oled.autoPrintln(true);
+        oled.print("Forecast loading...");
+        oled.autoPrintln(false);
+      } else {
+        oled.print("Next hour");
+        oled.setCursor(0, 2);
+        oled.print("Temp: ");
+        oled.print(globalForecast->temp[1]);
+        oled.setCursor(0, 4);
+        oled.print("Humid: ");
+        oled.print(globalForecast->humidity[1]);
+        oled.setCursor(0, 6);
+        oled.print("Rain: ");
+        oled.print(globalForecast->pop[1]);
+        oled.print("%");
+        oled.setCursor(0, 8);
+        oled.print(globalForecast->dt[1]);
       }
       break;
     default:
